@@ -1,0 +1,11 @@
+[project]
+name = "sec-integrity-manifest"
+version = "0.1.0"
+description = "GSB package integrity manifest verification challenge"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = []
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
