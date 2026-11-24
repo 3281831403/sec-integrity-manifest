@@ -1,4 +1,4 @@
-"""Package integrity manifest verification: executable specification (stubs only).
+"""Package integrity manifest verification: executable specification.
 
 A package root is a directory.  An unsigned manifest has this shape::
 
@@ -20,14 +20,45 @@ path may escape the root: absolute paths, Windows drive paths, UNC paths, dot
 segments and empty segments are all forbidden.  Every comparison in this
 module has tolerance 0: file sets, digests and signatures must match exactly.
 
-Only the standard library modules hashlib, hmac, json and os are used.  Every
-function here is currently a stub and raises NotImplementedError.
+Only the standard library modules hashlib, hmac, json and os are used.
 """
 
 import hashlib
 import hmac
 import json
 import os
+
+FORMAT = "sec-integrity-manifest/1"
+ALGORITHM = "sha256"
+_CHUNK_SIZE = 65536
+
+
+def _canonical_bytes(manifest):
+    """Return the canonical signed bytes of every member except ``signature``."""
+    payload = {name: value for name, value in manifest.items() if name != "signature"}
+    return json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+
+
+def _sha256_file(path):
+    """Hash a regular file with SHA-256 in fixed-size chunks."""
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        while True:
+            chunk = handle.read(_CHUNK_SIZE)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _is_inside(real_root, real_path):
+    """True when ``real_path`` is ``real_root`` itself or strictly below it."""
+    return real_path == real_root or real_path.startswith(real_root + os.sep)
 
 
 def build_manifest(root, entries):
@@ -60,7 +91,25 @@ def build_manifest(root, entries):
     ``files`` mapping; :func:`verify_package`, not this builder, rejects an
     empty manifest.
     """
-    raise NotImplementedError
+    real_root = os.path.realpath(os.fspath(root))
+    files = {}
+    for entry in entries:
+        if not path_allowed(entry):
+            raise ValueError("unsafe manifest path: %r" % (entry,))
+        if entry in files:
+            raise ValueError("duplicate manifest entry: %r" % (entry,))
+        candidate = os.path.join(real_root, *entry.split("/"))
+        real_file = os.path.realpath(candidate)
+        if not _is_inside(real_root, real_file):
+            raise ValueError("entry resolves outside the package root: %r" % (entry,))
+        if not os.path.isfile(real_file):
+            raise FileNotFoundError("no such regular file: %r" % (entry,))
+        files[entry] = _sha256_file(real_file)
+    return {
+        "format": FORMAT,
+        "algorithm": ALGORITHM,
+        "files": {name: files[name] for name in sorted(files)},
+    }
 
 
 def sign_manifest(manifest, key):
@@ -75,7 +124,17 @@ def sign_manifest(manifest, key):
     HMAC-SHA256 of those bytes.  Return a shallow copy with a ``signature``
     member; an existing signature is ignored and replaced.
     """
-    raise NotImplementedError
+    if not isinstance(manifest, dict):
+        raise ValueError("manifest must be a mapping")
+    if "format" not in manifest or "algorithm" not in manifest:
+        raise ValueError("manifest must carry format and algorithm")
+    if not isinstance(manifest.get("files"), dict):
+        raise ValueError("manifest must carry a files mapping")
+    signed = dict(manifest)
+    signed["signature"] = hmac.new(
+        key, _canonical_bytes(manifest), hashlib.sha256
+    ).hexdigest()
+    return signed
 
 
 def verify_signature(manifest, key):
@@ -93,7 +152,18 @@ def verify_signature(manifest, key):
     non-string signature, a wrong key type or malformed content.  This
     function only authenticates the signed object; it does not read files.
     """
-    raise NotImplementedError
+    if not isinstance(manifest, dict):
+        return False
+    supplied = manifest.get("signature")
+    if not isinstance(supplied, str):
+        return False
+    try:
+        expected = hmac.new(
+            key, _canonical_bytes(manifest), hashlib.sha256
+        ).hexdigest()
+    except (TypeError, ValueError):
+        return False
+    return hmac.compare_digest(expected, supplied)
 
 
 def compare(manifest, actual):
@@ -116,7 +186,24 @@ def compare(manifest, actual):
     are compared on every call.  Raise ``ValueError`` when the manifest has no
     mapping under ``files`` or when ``actual`` is not a mapping.
     """
-    raise NotImplementedError
+    expected = manifest.get("files") if isinstance(manifest, dict) else None
+    if not isinstance(expected, dict):
+        raise ValueError("manifest must carry a files mapping")
+    if not isinstance(actual, dict):
+        raise ValueError("actual must be a mapping of path to digest")
+    missing = sorted(name for name in expected if name not in actual)
+    extra = sorted(name for name in actual if name not in expected)
+    modified = sorted(
+        name
+        for name in expected
+        if name in actual and expected[name] != actual[name]
+    )
+    return {
+        "missing": missing,
+        "extra": extra,
+        "modified": modified,
+        "ok": not missing and not extra and not modified,
+    }
 
 
 def path_allowed(rel):
@@ -134,7 +221,18 @@ def path_allowed(rel):
     non-canonical path is a caller that may later make a different lexical
     decision.  Return false for non-string input.
     """
-    raise NotImplementedError
+    if not isinstance(rel, str) or not rel:
+        return False
+    if "\x00" in rel or "\\" in rel:
+        return False
+    if rel.startswith("/"):
+        return False
+    if len(rel) >= 2 and rel[1] == ":" and rel[0].isalpha():
+        return False
+    for segment in rel.split("/"):
+        if segment in ("", ".", ".."):
+            return False
+    return True
 
 
 def verify_package(root, manifest, key, policy):
@@ -175,7 +273,57 @@ def verify_package(root, manifest, key, policy):
     signature, path and root-confinement failures raise ``ValueError`` because
     they are trust failures, not content differences.
     """
-    raise NotImplementedError
+    problems = validate_policy(policy)
+    if problems:
+        raise ValueError("unsafe verification policy: %s" % ", ".join(problems))
+
+    if not isinstance(manifest, dict):
+        raise ValueError("manifest must be a mapping")
+    if manifest.get("format") != FORMAT:
+        raise ValueError("unsupported manifest format")
+    if manifest.get("algorithm") != ALGORITHM:
+        raise ValueError("unsupported digest algorithm")
+    if "signature" not in manifest:
+        raise ValueError("manifest is not signed")
+    if not verify_signature(manifest, key):
+        raise ValueError("invalid manifest signature")
+
+    files = manifest.get("files")
+    if not isinstance(files, dict) or not files:
+        raise ValueError("manifest must name at least one file")
+    for name in files:
+        if not path_allowed(name):
+            raise ValueError("unsafe manifest path: %r" % (name,))
+
+    real_root = os.path.realpath(os.fspath(root))
+    actual = {}
+    for dirpath, dirnames, filenames in os.walk(real_root, followlinks=False):
+        for dirname in dirnames:
+            real_dir = os.path.realpath(os.path.join(dirpath, dirname))
+            if not _is_inside(real_root, real_dir):
+                raise ValueError(
+                    "directory resolves outside the package root: %r" % (dirname,)
+                )
+        for filename in filenames:
+            full = os.path.join(dirpath, filename)
+            real_file = os.path.realpath(full)
+            if not _is_inside(real_root, real_file):
+                raise ValueError(
+                    "file resolves outside the package root: %r" % (filename,)
+                )
+            if not os.path.isfile(real_file):
+                continue
+            relative = os.path.relpath(real_file, real_root).replace(os.sep, "/")
+            actual[relative] = _sha256_file(real_file)
+
+    difference = compare(manifest, actual)
+    return {
+        "ok": difference["ok"],
+        "signature_ok": True,
+        "missing": difference["missing"],
+        "extra": difference["extra"],
+        "modified": difference["modified"],
+    }
 
 
 def validate_policy(policy):
@@ -193,7 +341,16 @@ def validate_policy(policy):
     are ignored.  A policy that ignores extra files is invalid even if the
     other two switches are enabled.
     """
-    raise NotImplementedError
+    if not isinstance(policy, dict):
+        return ["policy_invalid"]
+    problems = []
+    if policy.get("require_signature") is not True:
+        problems.append("signature_not_required")
+    if policy.get("forbid_extra") is not True:
+        problems.append("extra_files_not_rejected")
+    if policy.get("restrict_paths") is not True:
+        problems.append("paths_not_restricted")
+    return problems
 
 
 def manifest_batch(packages, policy):
@@ -222,4 +379,16 @@ def manifest_batch(packages, policy):
     continue with the remaining packages.  Names are processed in sorted
     order for deterministic output.  Do not mutate the input.
     """
-    raise NotImplementedError
+    problems = validate_policy(policy)
+    if problems:
+        raise ValueError("unsafe verification policy: %s" % ", ".join(problems))
+    reports = {}
+    for name in sorted(packages):
+        record = packages[name]
+        try:
+            reports[name] = verify_package(
+                record["root"], record["manifest"], record["key"], policy
+            )
+        except ValueError as exc:
+            reports[name] = {"ok": False, "error": str(exc)}
+    return reports
